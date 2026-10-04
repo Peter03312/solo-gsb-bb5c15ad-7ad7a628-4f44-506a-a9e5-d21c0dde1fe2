@@ -259,6 +259,41 @@ def get_plan(db: Session, plan_id: str) -> models.Plan:
     return plan
 
 
+def _check_confirm_revisions(
+    submitted_slots: int,
+    submitted_manifest: int,
+    plan_slots: int,
+    plan_manifest: int,
+    latest_slots: int,
+    latest_manifest: int,
+) -> None:
+    """核对确认三方修订：提交修订 == 方案所用修订 == 当前最新修订。
+
+    任一不一致即拒绝（409），方案保持原状。锁外预检与写锁内复核共用
+    本函数，保证两条路径返回完全一致的冲突响应。
+    """
+    if submitted_slots != plan_slots:
+        raise ConflictError(
+            f"提交的槽位资料修订 {submitted_slots} 与方案修订 "
+            f"{plan_slots} 不一致，拒绝确认"
+        )
+    if submitted_manifest != plan_manifest:
+        raise ConflictError(
+            f"提交的箱清单修订 {submitted_manifest} 与方案修订 "
+            f"{plan_manifest} 不一致，拒绝确认"
+        )
+    if plan_slots != latest_slots:
+        raise ConflictError(
+            f"槽位资料已过期：方案基于修订 {plan_slots}，"
+            f"当前最新修订 {latest_slots}，原方案保持不变"
+        )
+    if plan_manifest != latest_manifest:
+        raise ConflictError(
+            f"箱清单已过期：方案基于修订 {plan_manifest}，"
+            f"当前最新修订 {latest_manifest}，原方案保持不变"
+        )
+
+
 def confirm_plan(
     db: Session,
     plan_id: str,
@@ -276,28 +311,14 @@ def confirm_plan(
         raise ConflictError("方案已确认，不能重复确认（如资料已更新请修订方案后重新确认）")
 
     # 核对参与方案的箱与槽位资料修订；过期则拒绝，原方案保持草稿不变
+    # （锁外快速预检；权威复核在下方写锁内按实际提交先后重做一次）
     latest_slots = _latest_slot_revision(db)
     latest_manifest = _latest_manifest_revision(db)
-    if payload.slots_revision != plan.slots_revision:
-        raise ConflictError(
-            f"提交的槽位资料修订 {payload.slots_revision} 与方案修订 "
-            f"{plan.slots_revision} 不一致，拒绝确认"
-        )
-    if payload.manifest_revision != plan.manifest_revision:
-        raise ConflictError(
-            f"提交的箱清单修订 {payload.manifest_revision} 与方案修订 "
-            f"{plan.manifest_revision} 不一致，拒绝确认"
-        )
-    if plan.slots_revision != latest_slots:
-        raise ConflictError(
-            f"槽位资料已过期：方案基于修订 {plan.slots_revision}，"
-            f"当前最新修订 {latest_slots}，原方案保持不变"
-        )
-    if plan.manifest_revision != latest_manifest:
-        raise ConflictError(
-            f"箱清单已过期：方案基于修订 {plan.manifest_revision}，"
-            f"当前最新修订 {latest_manifest}，原方案保持不变"
-        )
+    _check_confirm_revisions(
+        payload.slots_revision, payload.manifest_revision,
+        plan.slots_revision, plan.manifest_revision,
+        latest_slots, latest_manifest,
+    )
 
     # 读检查完成后快照本方案占用槽位，并释放只读事务；
     # 随后在独立连接上以 IMMEDIATE 立即拿写锁，串行化并发确认；
@@ -313,19 +334,48 @@ def confirm_plan(
         cursor.execute("BEGIN IMMEDIATE")
 
         cursor.execute(
-            "SELECT status, revision_no, root_id FROM plans WHERE id = ?",
+            "SELECT status, revision_no, root_id, slots_revision, manifest_revision "
+            "FROM plans WHERE id = ?",
             (plan.id,),
         )
         row = cursor.fetchone()
         if row is None:
             conn.rollback()
             raise ConflictError("方案在确认期间被删除，确认被拒绝")
-        status_locked, rev_no_locked, root_locked = row
+        (status_locked, rev_no_locked, root_locked,
+         slots_rev_locked, manifest_rev_locked) = row
+        if status_locked == "confirmed":
+            # 同一已确认方案的原样重复确认保持幂等：并发的同内容确认已先
+            # 提交时，本次直接返回已确认方案，不重复占用槽位
+            if (payload.slots_revision == slots_rev_locked
+                    and payload.manifest_revision == manifest_rev_locked):
+                conn.rollback()
+                db.expire_all()
+                return get_plan(db, plan_id)
+            conn.rollback()
+            raise ConflictError(
+                "方案已确认，不能重复确认（如资料已更新请修订方案后重新确认）"
+            )
         if status_locked != "draft":
             conn.rollback()
             raise ConflictError(
                 f"方案状态已为 {status_locked}（并发操作），本次确认被拒绝，原方案不变"
             )
+
+        # 竞态修复：在写锁内按确认与资料更新的实际提交先后，重新核对方案
+        # 所用修订、提交修订与当时最新修订三者一致。锁外预检到拿锁之间提交
+        # 的新资料在此被拦截——新资料先提交（或三者不一致）则拒绝，草稿、
+        # 同链旧已确认方案与槽位占用均不变；确认先提交则成功，之后的资料
+        # 更新不追溯撤销。
+        cursor.execute("SELECT COALESCE(MAX(revision), 0) FROM slot_revisions")
+        latest_slots_locked = cursor.fetchone()[0]
+        cursor.execute("SELECT COALESCE(MAX(revision), 0) FROM manifest_revisions")
+        latest_manifest_locked = cursor.fetchone()[0]
+        _check_confirm_revisions(
+            payload.slots_revision, payload.manifest_revision,
+            slots_rev_locked, manifest_rev_locked,
+            latest_slots_locked, latest_manifest_locked,
+        )
 
         cursor.execute(
             "SELECT id FROM plans WHERE root_id = ? AND status = 'confirmed' "

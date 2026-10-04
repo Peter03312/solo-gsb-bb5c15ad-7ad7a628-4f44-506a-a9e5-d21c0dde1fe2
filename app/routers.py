@@ -190,7 +190,7 @@ def amend_plan(plan_id: str, body: PlanAmendIn, db: Session = Depends(get_db)):
     "/plans/{plan_id}/confirm",
     response_model=PlanOut,
     responses={409: {"model": MessageOut}},
-    summary="确认方案（核对资料修订；并发安全）",
+    summary="确认方案（写锁内按提交先后核对资料修订；并发安全、同内容重复确认幂等）",
 )
 def confirm_plan(plan_id: str, body: PlanConfirmIn, db: Session = Depends(get_db)):
     plan = services.confirm_plan(db, plan_id, body)
