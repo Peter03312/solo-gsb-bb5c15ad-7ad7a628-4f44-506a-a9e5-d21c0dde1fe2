@@ -275,7 +275,9 @@ def confirm_plan(
             return plan
         raise ConflictError("方案已确认，不能重复确认（如资料已更新请修订方案后重新确认）")
 
-    # 核对参与方案的箱与槽位资料修订；过期则拒绝，原方案保持草稿不变
+    # 核对参与方案的箱与槽位资料修订；过期则拒绝，原方案保持草稿不变。
+    # 此处为拿锁前的快速预检（方案修订号创建后不变，预检结果稳定）；
+    # 资料是否过期以写锁内按实际提交先后的复核为准（见下）。
     latest_slots = _latest_slot_revision(db)
     latest_manifest = _latest_manifest_revision(db)
     if payload.slots_revision != plan.slots_revision:
@@ -300,7 +302,9 @@ def confirm_plan(
         )
 
     # 读检查完成后快照本方案占用槽位，并释放只读事务；
-    # 随后在独立连接上以 IMMEDIATE 立即拿写锁，串行化并发确认；
+    # 随后在独立连接上以 IMMEDIATE 立即拿写锁，串行化并发确认与资料修订录入：
+    # 写锁是确认与资料更新实际提交先后的串行化点，锁内必须按当时最新资料
+    # 修订再次复核（防止读检查与拿锁之间恰好提交了新资料而沿用过期方案）；
     # 槽位唯一索引兜底冲突占用。锁内不使用 ORM 会话，避免隐式事务干扰。
     plan_slots = tuple(i.slot_code for i in plan.items)
     db.rollback()
@@ -313,18 +317,43 @@ def confirm_plan(
         cursor.execute("BEGIN IMMEDIATE")
 
         cursor.execute(
-            "SELECT status, revision_no, root_id FROM plans WHERE id = ?",
+            "SELECT status, revision_no, root_id, slots_revision, "
+            "manifest_revision FROM plans WHERE id = ?",
             (plan.id,),
         )
         row = cursor.fetchone()
         if row is None:
             conn.rollback()
             raise ConflictError("方案在确认期间被删除，确认被拒绝")
-        status_locked, rev_no_locked, root_locked = row
+        (status_locked, rev_no_locked, root_locked,
+         slots_rev_locked, manifest_rev_locked) = row
         if status_locked != "draft":
             conn.rollback()
             raise ConflictError(
                 f"方案状态已为 {status_locked}（并发操作），本次确认被拒绝，原方案不变"
+            )
+
+        # 锁内按确认与资料更新的实际提交先后复核三类修订：方案所用修订
+        # （锁内行值，方案的修订号创建后不变，锁外已核对与提交修订一致）、
+        # 提交修订（请求载荷）与当时最新修订（锁内 MAX）。
+        # 资料更新若在拿锁前已提交，锁内即可见新修订 -> 按过期拒绝，
+        # 草稿、同链旧已确认方案与槽位占用均不变；
+        # 确认先拿锁提交则成功，其后的资料更新不追溯撤销已确认方案。
+        cursor.execute("SELECT COALESCE(MAX(revision), 0) FROM slot_revisions")
+        latest_slots_locked = cursor.fetchone()[0]
+        cursor.execute("SELECT COALESCE(MAX(revision), 0) FROM manifest_revisions")
+        latest_manifest_locked = cursor.fetchone()[0]
+        if slots_rev_locked != latest_slots_locked:
+            conn.rollback()
+            raise ConflictError(
+                f"槽位资料已过期：方案基于修订 {slots_rev_locked}，"
+                f"当前最新修订 {latest_slots_locked}，原方案保持不变"
+            )
+        if manifest_rev_locked != latest_manifest_locked:
+            conn.rollback()
+            raise ConflictError(
+                f"箱清单已过期：方案基于修订 {manifest_rev_locked}，"
+                f"当前最新修订 {latest_manifest_locked}，原方案保持不变"
             )
 
         cursor.execute(

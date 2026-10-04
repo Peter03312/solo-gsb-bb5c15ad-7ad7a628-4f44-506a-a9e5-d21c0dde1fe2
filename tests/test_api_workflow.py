@@ -178,3 +178,210 @@ def test_concurrent_confirm_disjoint_plans(client):
 
 def test_get_nonexistent_plan_404(client):
     assert client.get("/api/plans/nope").status_code == 404
+
+
+def _commit_slot_revision(revision: int) -> None:
+    """在独立会话上直接提交一条新槽位资料修订（模拟资料更新的实际提交）。"""
+    s = SessionLocal()
+    try:
+        s.add(models.SlotRevision(
+            revision=revision, min_moment=-100000, max_moment=100000,
+        ))
+        s.commit()
+    finally:
+        s.close()
+
+
+def _commit_manifest_revision(revision: int) -> None:
+    """在独立会话上直接提交一条新箱清单修订（模拟资料更新的实际提交）。"""
+    s = SessionLocal()
+    try:
+        s.add(models.ManifestRevision(revision=revision))
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_confirm_race_slot_revision_committed_before_lock(client, monkeypatch):
+    """读检查与拿写锁之间提交了新槽位资料：确认按过期拒绝（409），草稿不变。"""
+    sr, mr = _seed(client)
+    plan = client.post("/api/plans/compute", json={}).json()
+
+    from app import services
+
+    original = services._latest_slot_revision
+    bumped = False
+
+    def racy_latest(db):
+        nonlocal bumped
+        latest = original(db)
+        if not bumped:
+            bumped = True
+            # 模拟竞态：确认读取最新修订之后、取得写锁之前，新槽位资料先提交
+            _commit_slot_revision(latest + 1)
+        return latest
+
+    monkeypatch.setattr(services, "_latest_slot_revision", racy_latest)
+
+    r = client.post(f"/api/plans/{plan['plan_id']}/confirm", json={
+        "slots_revision": sr, "manifest_revision": mr
+    })
+    assert r.status_code == 409
+    assert "已过期" in r.json()["detail"]
+    # 草稿与槽位占用均不变
+    assert client.get(f"/api/plans/{plan['plan_id']}").json()["status"] == "draft"
+    db = SessionLocal()
+    try:
+        assert db.query(models.ConfirmedSlot).count() == 0
+    finally:
+        db.close()
+
+
+def test_confirm_race_manifest_revision_committed_before_lock(client, monkeypatch):
+    """读检查与拿写锁之间提交了新箱清单：确认按过期拒绝（409），草稿不变。"""
+    sr, mr = _seed(client)
+    plan = client.post("/api/plans/compute", json={}).json()
+
+    from app import services
+
+    original = services._latest_manifest_revision
+    bumped = False
+
+    def racy_latest(db):
+        nonlocal bumped
+        latest = original(db)
+        if not bumped:
+            bumped = True
+            # 模拟竞态：确认读取最新修订之后、取得写锁之前，新箱清单先提交
+            _commit_manifest_revision(latest + 1)
+        return latest
+
+    monkeypatch.setattr(services, "_latest_manifest_revision", racy_latest)
+
+    r = client.post(f"/api/plans/{plan['plan_id']}/confirm", json={
+        "slots_revision": sr, "manifest_revision": mr
+    })
+    assert r.status_code == 409
+    assert "已过期" in r.json()["detail"]
+    assert client.get(f"/api/plans/{plan['plan_id']}").json()["status"] == "draft"
+    db = SessionLocal()
+    try:
+        assert db.query(models.ConfirmedSlot).count() == 0
+    finally:
+        db.close()
+
+
+def test_confirm_race_keeps_chain_and_slot_occupancy(client, monkeypatch):
+    """竞态拒绝时：同链旧已确认方案、草稿与槽位占用均不变。"""
+    sr, mr = _seed(client)
+    p1 = client.post("/api/plans/compute", json={}).json()
+    client.post(f"/api/plans/{p1['plan_id']}/confirm", json={
+        "slots_revision": sr, "manifest_revision": mr
+    })
+
+    # 新箱清单（rev2），基于已确认 p1 修订出草稿 p2
+    client.post("/api/manifest-revisions", json={
+        "containers": [
+            {"no": "C001", "weight": 15, "hazmat": None, "discharge_order": 1},
+        ]
+    })
+    p2 = client.post(f"/api/plans/{p1['plan_id']}/amend", json={}).json()
+    assert p2["status"] == "draft"
+
+    from app import services
+
+    original = services._latest_slot_revision
+    bumped = False
+
+    def racy_latest(db):
+        nonlocal bumped
+        latest = original(db)
+        if not bumped:
+            bumped = True
+            # p2 确认读检查之后、拿写锁之前，新槽位资料先提交
+            _commit_slot_revision(latest + 1)
+        return latest
+
+    monkeypatch.setattr(services, "_latest_slot_revision", racy_latest)
+
+    r = client.post(f"/api/plans/{p2['plan_id']}/confirm", json={
+        "slots_revision": sr, "manifest_revision": mr + 1
+    })
+    assert r.status_code == 409
+    assert "已过期" in r.json()["detail"]
+
+    # 旧已确认方案不被取代、草稿保持草稿、槽位占用仍属旧方案
+    assert client.get(f"/api/plans/{p1['plan_id']}").json()["status"] == "confirmed"
+    assert client.get(f"/api/plans/{p2['plan_id']}").json()["status"] == "draft"
+    db = SessionLocal()
+    try:
+        rows = db.query(models.ConfirmedSlot).all()
+        assert {row.slot_code for row in rows} == {"A01", "B01"}
+        assert {row.plan_id for row in rows} == {p1["plan_id"]}
+    finally:
+        db.close()
+
+
+def test_confirm_committed_before_data_update_not_revoked(client):
+    """确认先提交则成功；其后的资料更新不追溯撤销，原样重复确认仍幂等。"""
+    sr, mr = _seed(client)
+    plan = client.post("/api/plans/compute", json={}).json()
+    ok = client.post(f"/api/plans/{plan['plan_id']}/confirm", json={
+        "slots_revision": sr, "manifest_revision": mr
+    })
+    assert ok.status_code == 200
+
+    # 确认提交之后才产生新资料修订：不追溯撤销已确认方案
+    client.post("/api/slot-revisions", json=SLOT_PAYLOAD)
+    client.post("/api/manifest-revisions", json=MANIFEST_PAYLOAD)
+    assert client.get(f"/api/plans/{plan['plan_id']}").json()["status"] == "confirmed"
+
+    # 同一已确认方案的原样重复确认保持幂等
+    again = client.post(f"/api/plans/{plan['plan_id']}/confirm", json={
+        "slots_revision": sr, "manifest_revision": mr
+    })
+    assert again.status_code == 200
+    assert again.json()["status"] == "confirmed"
+
+
+def test_concurrent_confirm_and_data_update_commit_order(client):
+    """确认与资料更新并发：按实际提交先后定论，且结果状态自洽。"""
+    sr, mr = _seed(client)
+    plan = client.post("/api/plans/compute", json={}).json()
+
+    results = {}
+
+    def confirm():
+        local = TestClient(app)
+        results["confirm"] = local.post(
+            f"/api/plans/{plan['plan_id']}/confirm",
+            json={"slots_revision": sr, "manifest_revision": mr},
+        ).status_code
+
+    def bump():
+        local = TestClient(app)
+        results["bump"] = local.post(
+            "/api/slot-revisions", json=SLOT_PAYLOAD
+        ).status_code
+
+    t1 = threading.Thread(target=confirm)
+    t2 = threading.Thread(target=bump)
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    # 资料更新本身总是成功（要么先于确认提交，要么在确认提交后生效）
+    assert results["bump"] == 201
+    status = client.get(f"/api/plans/{plan['plan_id']}").json()["status"]
+    db = SessionLocal()
+    try:
+        occupied = db.query(models.ConfirmedSlot).count()
+    finally:
+        db.close()
+    if results["confirm"] == 200:
+        # 确认先提交：成功，随后的资料更新不追溯撤销
+        assert status == "confirmed"
+        assert occupied == 2
+    else:
+        # 资料更新先提交：确认按过期拒绝，草稿与槽位占用不变
+        assert results["confirm"] == 409
+        assert status == "draft"
+        assert occupied == 0
